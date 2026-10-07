@@ -1,40 +1,36 @@
+# Local Image Optimizer for macOS
 
-# Image Optimizer Streamlit
-
-A local Streamlit tool for converting and reducing JPG, PNG and WebP images.
+Built for large local image folders (including folders that are several GB).
 
 ## Features
-
-- Select input and output folders with Browse buttons
-- JPG / PNG / WebP input support
-- Convert to JPG, PNG or WebP
+- Direct input/output folder selection
+- No upload and no ZIP required
+- JPG / JPEG / PNG / WebP input
+- JPG / PNG / WebP output
 - Quality/compression slider
-- Recursive subfolder scanning
-- Option to preserve folder structure
-- Skip files when the converted result is larger
-- Overwrite control
-- Progress bar and conversion summary
-- Preserves transparency for PNG/WebP
-- JPG conversion places transparent areas on a white background
-
-## Install
-
-Open Terminal in this folder and run:
-
-```bash
-python3 -m pip install -r requirements.txt
-```
+- Parallel processing
+- Recursive subfolders
+- Preserve folder structure
+- Optional overwrite
+- Optional delete-original-after-success
+- Skip conversions that would be larger
+- Progress, speed, ETA and space saved
 
 ## Start
+Double-click `Start_Image_Optimizer.command`.
+
+If macOS blocks it, right-click the file, choose **Open**, then confirm.
+
+Or run:
 
 ```bash
+cd /path/to/Image_Optimizer_Local_Mac
+python3 -m pip install -r requirements.txt
 python3 -m streamlit run app.py
 ```
 
-Your browser should open automatically.
+The app normally opens at `http://localhost:8501`.
 
-## macOS folder picker
+The Browse buttons use the normal macOS folder chooser. If macOS asks for Automation/System Events permission, allow it.
 
-The Browse buttons use the native Tk folder picker available with most macOS Python installations.
-
-If the Browse button does not open a picker, you can still paste the folder path directly into the Input/Output fields.
+For large folders, start with 4–8 workers. Test on a small sample before enabling **Delete original after success**.
