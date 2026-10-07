@@ -1,332 +1,543 @@
 from pathlib import Path
-import zipfile, os, textwrap
+import zipfile, os
 
-base = Path("/mnt/data/image_optimizer_streamlit_hosted")
-base.mkdir(exist_ok=True)
+out = Path("/mnt/data/streamlit_image_optimizer_fixed")
+out.mkdir(exist_ok=True)
 
-app_code = r'''
+app_py = r'''
 import io
 import os
 import zipfile
-import tempfile
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 from PIL import Image, ImageOps
 
-SUPPORTED = {".jpg", ".jpeg", ".png", ".webp"}
-
 st.set_page_config(
-    page_title="Image Optimizer",
+    page_title="Image Optimizer & Converter",
     page_icon="🖼️",
     layout="wide",
 )
 
-st.markdown("""
-<style>
-.block-container {max-width: 1180px; padding-top: 2rem;}
-div[data-testid="stMetricValue"] {font-size: 1.6rem;}
-</style>
-""", unsafe_allow_html=True)
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
-def human_size(num):
-    num = float(num)
+# ---------- Styling ----------
+st.markdown(
+    """
+    <style>
+        .block-container {
+            max-width: 1150px;
+            padding-top: 2rem;
+            padding-bottom: 3rem;
+        }
+
+        h1 {
+            margin-bottom: 0.25rem;
+        }
+
+        div[data-testid="stMetric"] {
+            border: 1px solid rgba(128,128,128,0.22);
+            padding: 14px;
+            border-radius: 12px;
+        }
+
+        div.stButton > button,
+        div.stDownloadButton > button {
+            border-radius: 10px;
+            min-height: 46px;
+            font-weight: 600;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ---------- Helpers ----------
+def human_size(size_bytes: int) -> str:
+    size = float(size_bytes)
+
     for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if num < 1024 or unit == "TB":
-            return f"{num:.1f} {unit}"
-        num /= 1024
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
 
-def ensure_rgb(img, background="white"):
-    if img.mode in ("RGBA", "LA") or "transparency" in img.info:
+    return f"{size:.1f} TB"
+
+
+def image_has_transparency(img: Image.Image) -> bool:
+    return (
+        img.mode in ("RGBA", "LA")
+        or (img.mode == "P" and "transparency" in img.info)
+    )
+
+
+def flatten_to_rgb(img: Image.Image, background=(255, 255, 255)) -> Image.Image:
+    """Convert an image to RGB. Transparent pixels become white."""
+    if image_has_transparency(img):
         rgba = img.convert("RGBA")
-        bg = Image.new("RGBA", rgba.size, background)
-        bg.alpha_composite(rgba)
-        return bg.convert("RGB")
+        base = Image.new("RGBA", rgba.size, background + (255,))
+        base.alpha_composite(rgba)
+        return base.convert("RGB")
+
     return img.convert("RGB")
 
-def convert_bytes(data, filename, fmt, quality):
-    with Image.open(io.BytesIO(data)) as im:
-        im.load()
-        im = ImageOps.exif_transpose(im)
-        out = io.BytesIO()
 
-        if fmt == "JPG":
-            work = ensure_rgb(im)
-            work.save(
-                out,
+def convert_image(image_bytes: bytes, output_format: str, quality: int) -> bytes:
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        img.load()
+        img = ImageOps.exif_transpose(img)
+
+        output = io.BytesIO()
+
+        if output_format == "JPG":
+            converted = flatten_to_rgb(img)
+            converted.save(
+                output,
                 format="JPEG",
                 quality=quality,
                 optimize=True,
                 progressive=True,
             )
 
-        elif fmt == "WEBP":
-            work = (
-                im.convert("RGBA")
-                if im.mode in ("RGBA", "LA") or "transparency" in im.info
-                else im.convert("RGB")
-            )
-            work.save(
-                out,
+        elif output_format == "WEBP":
+            if image_has_transparency(img):
+                converted = img.convert("RGBA")
+            else:
+                converted = img.convert("RGB")
+
+            converted.save(
+                output,
                 format="WEBP",
                 quality=quality,
                 method=6,
             )
 
-        elif fmt == "PNG":
-            compress_level = max(0, min(9, round(quality / 100 * 9)))
-            work = im.copy()
-            if work.mode not in ("RGB", "RGBA", "L", "LA", "P"):
-                work = work.convert("RGBA")
-            work.save(
-                out,
+        elif output_format == "PNG":
+            if img.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+                converted = img.convert("RGBA")
+            else:
+                converted = img.copy()
+
+            # PNG is lossless. Higher slider values use stronger compression.
+            compression_level = max(0, min(9, round((quality / 100) * 9)))
+
+            converted.save(
+                output,
                 format="PNG",
                 optimize=True,
-                compress_level=compress_level,
+                compress_level=compression_level,
             )
 
-        return out.getvalue()
+        else:
+            raise ValueError(f"Unsupported output format: {output_format}")
 
-def output_name(name, fmt):
-    p = Path(name)
-    ext = ".jpg" if fmt == "JPG" else f".{fmt.lower()}"
-    return str(p.with_suffix(ext))
+        return output.getvalue()
 
-def extract_zip(uploaded_zip):
-    files = []
-    with zipfile.ZipFile(uploaded_zip) as zf:
-        for info in zf.infolist():
+
+def output_filename(original_name: str, output_format: str) -> str:
+    path = Path(original_name)
+
+    if output_format == "JPG":
+        extension = ".jpg"
+    elif output_format == "WEBP":
+        extension = ".webp"
+    else:
+        extension = ".png"
+
+    return str(path.with_suffix(extension))
+
+
+def load_images_from_zip(zip_bytes: bytes):
+    images = []
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as archive:
+        for info in archive.infolist():
             if info.is_dir():
                 continue
-            p = Path(info.filename)
-            if p.suffix.lower() in SUPPORTED:
-                files.append({
+
+            file_path = Path(info.filename)
+
+            # Ignore macOS metadata files.
+            if "__MACOSX" in file_path.parts or file_path.name.startswith("._"):
+                continue
+
+            if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+
+            images.append(
+                {
                     "name": info.filename,
-                    "data": zf.read(info),
-                })
-    return files
+                    "data": archive.read(info),
+                }
+            )
 
+    return images
+
+
+def deduplicate_names(items):
+    """Avoid duplicate ZIP paths if uploads contain the same filename."""
+    seen = {}
+    result = []
+
+    for item in items:
+        original_name = item["name"]
+        path = Path(original_name)
+        key = original_name.lower()
+
+        if key not in seen:
+            seen[key] = 1
+            result.append(item)
+            continue
+
+        seen[key] += 1
+        copy_number = seen[key]
+
+        new_name = str(
+            path.with_name(f"{path.stem}_{copy_number}{path.suffix}")
+        )
+
+        copied = dict(item)
+        copied["name"] = new_name
+        result.append(copied)
+
+    return result
+
+
+# ---------- Header ----------
 st.title("🖼️ Image Optimizer & Converter")
-st.caption("Convert and compress JPG, PNG and WebP images directly in your browser.")
+st.caption(
+    "Convert JPG, PNG and WebP images online, reduce file size, "
+    "and download everything as a ZIP."
+)
 
-tab_files, tab_zip = st.tabs(["Upload Images", "Upload ZIP / Folder"])
+st.info(
+    "Because this app is hosted online, it cannot directly browse folders on your Mac. "
+    "Upload individual images or upload a ZIP of an entire folder."
+)
+
+
+# ---------- Upload ----------
+tab1, tab2 = st.tabs(["📷 Upload Images", "📦 Upload Folder as ZIP"])
 
 uploaded_items = []
 
-with tab_files:
-    uploads = st.file_uploader(
-        "Choose images",
+with tab1:
+    files = st.file_uploader(
+        "Select JPG, PNG or WebP images",
         type=["jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
-        help="You can select multiple images at once.",
+        key="individual_images",
     )
-    if uploads:
+
+    if files:
         uploaded_items.extend(
-            {"name": f.name, "data": f.getvalue()} for f in uploads
+            {
+                "name": uploaded_file.name,
+                "data": uploaded_file.getvalue(),
+            }
+            for uploaded_file in files
         )
 
-with tab_zip:
-    zip_upload = st.file_uploader(
-        "Choose a ZIP file",
+with tab2:
+    zip_file = st.file_uploader(
+        "Upload a ZIP containing your image folder",
         type=["zip"],
         accept_multiple_files=False,
-        help="ZIP a whole folder on your Mac and upload it here. Subfolder structure will be preserved.",
-        key="zip_upload",
+        key="folder_zip",
+        help="On macOS: right-click a folder and choose Compress.",
     )
-    if zip_upload:
-        try:
-            uploaded_items.extend(extract_zip(io.BytesIO(zip_upload.getvalue())))
-        except Exception as e:
-            st.error(f"Could not read ZIP: {e}")
 
+    if zip_file is not None:
+        try:
+            uploaded_items.extend(
+                load_images_from_zip(zip_file.getvalue())
+            )
+        except zipfile.BadZipFile:
+            st.error("The uploaded file is not a valid ZIP.")
+        except Exception as exc:
+            st.error(f"Could not read the ZIP: {exc}")
+
+
+uploaded_items = deduplicate_names(uploaded_items)
+
+
+# ---------- Options ----------
 st.divider()
 
-c1, c2, c3 = st.columns([1.1, 1.4, 1.5])
+st.subheader("Conversion Settings")
 
-with c1:
-    fmt = st.selectbox("Convert to", ["JPG", "WEBP", "PNG"])
+col1, col2, col3 = st.columns([1, 1.4, 1.6])
 
-with c2:
-    quality = st.slider("Quality / compression", 1, 100, 85, 1)
-
-with c3:
-    only_if_smaller = st.toggle("Only keep output if smaller", value=True)
-
-if fmt == "PNG":
-    st.info(
-        "PNG is lossless. The slider controls compression effort, not visual quality. "
-        "For much smaller files, WebP is usually the better choice."
+with col1:
+    output_format = st.selectbox(
+        "Convert to",
+        ["JPG", "WEBP", "PNG"],
+        index=0,
     )
 
-total_size = sum(len(x["data"]) for x in uploaded_items)
+with col2:
+    quality = st.slider(
+        "Quality / compression",
+        min_value=1,
+        max_value=100,
+        value=85,
+        step=1,
+    )
+
+with col3:
+    only_if_smaller = st.toggle(
+        "Only keep converted file when smaller",
+        value=True,
+    )
+
+if output_format == "PNG":
+    st.warning(
+        "PNG is lossless. The slider changes compression effort, not visual quality. "
+        "For much smaller image files, WebP is normally the better option."
+    )
+
+
+# ---------- Input summary ----------
+total_input_size = sum(len(item["data"]) for item in uploaded_items)
 
 m1, m2, m3 = st.columns(3)
-m1.metric("Images loaded", f"{len(uploaded_items):,}")
-m2.metric("Input size", human_size(total_size))
-m3.metric("Target format", fmt)
 
-with st.expander("Preview file list", expanded=False):
-    if uploaded_items:
-        for item in uploaded_items[:200]:
-            st.write(f"• {item['name']}")
-        if len(uploaded_items) > 200:
-            st.caption(f"Showing first 200 of {len(uploaded_items):,} files.")
-    else:
+with m1:
+    st.metric("Images loaded", f"{len(uploaded_items):,}")
+
+with m2:
+    st.metric("Input size", human_size(total_input_size))
+
+with m3:
+    st.metric("Output format", output_format)
+
+
+with st.expander("Preview file list"):
+    if not uploaded_items:
         st.write("No images uploaded yet.")
+    else:
+        for item in uploaded_items[:250]:
+            st.write(f"• {item['name']}")
 
+        if len(uploaded_items) > 250:
+            st.caption(
+                f"Showing 250 of {len(uploaded_items):,} files."
+            )
+
+
+# ---------- Conversion ----------
 st.divider()
 
-if st.button(
+convert_clicked = st.button(
     "🚀 Convert Images",
     type="primary",
     use_container_width=True,
-    disabled=not uploaded_items,
-):
-    progress = st.progress(0)
-    status = st.empty()
+    disabled=(len(uploaded_items) == 0),
+)
 
-    results = []
-    max_workers = min(8, max(2, os.cpu_count() or 2))
+if convert_clicked:
+    progress_bar = st.progress(0)
+    progress_text = st.empty()
 
-    def job(item):
+    converted_files = []
+    skipped_files = []
+    failed_files = []
+
+    converted_original_size = 0
+    converted_output_size = 0
+
+    total_files = len(uploaded_items)
+
+    for index, item in enumerate(uploaded_items, start=1):
         try:
-            old_size = len(item["data"])
-            converted = convert_bytes(
-                item["data"],
-                item["name"],
-                fmt,
+            original_data = item["data"]
+            original_size = len(original_data)
+
+            converted_data = convert_image(
+                original_data,
+                output_format,
                 quality,
             )
-            new_size = len(converted)
 
-            if only_if_smaller and new_size >= old_size:
-                return {
-                    "status": "SKIPPED",
+            new_size = len(converted_data)
+
+            if only_if_smaller and new_size >= original_size:
+                skipped_files.append(
+                    {
+                        "name": item["name"],
+                        "reason": "Converted image would not be smaller",
+                        "original_size": original_size,
+                        "new_size": new_size,
+                    }
+                )
+            else:
+                converted_files.append(
+                    {
+                        "name": output_filename(
+                            item["name"],
+                            output_format,
+                        ),
+                        "data": converted_data,
+                        "original_size": original_size,
+                        "new_size": new_size,
+                    }
+                )
+
+                converted_original_size += original_size
+                converted_output_size += new_size
+
+        except Exception as exc:
+            failed_files.append(
+                {
                     "name": item["name"],
-                    "old": old_size,
-                    "new": new_size,
-                    "data": None,
-                    "reason": "Converted file would not be smaller",
+                    "reason": str(exc),
                 }
+            )
 
-            return {
-                "status": "CONVERTED",
-                "name": output_name(item["name"], fmt),
-                "old": old_size,
-                "new": new_size,
-                "data": converted,
-                "reason": "",
-            }
+        progress_bar.progress(index / total_files)
+        progress_text.text(
+            f"Processing {index:,} of {total_files:,} images..."
+        )
 
-        except Exception as e:
-            return {
-                "status": "ERROR",
-                "name": item["name"],
-                "old": len(item["data"]),
-                "new": 0,
-                "data": None,
-                "reason": str(e),
-            }
+    progress_text.empty()
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(job, item) for item in uploaded_items]
+    bytes_saved = max(
+        0,
+        converted_original_size - converted_output_size,
+    )
 
-        for idx, future in enumerate(as_completed(futures), start=1):
-            results.append(future.result())
-            progress.progress(idx / len(futures))
-            status.text(f"Processing {idx:,} / {len(futures):,}")
-
-    status.empty()
-
-    converted = [r for r in results if r["status"] == "CONVERTED"]
-    skipped = [r for r in results if r["status"] == "SKIPPED"]
-    errors = [r for r in results if r["status"] == "ERROR"]
-
-    old_total = sum(r["old"] for r in converted)
-    new_total = sum(r["new"] for r in converted)
-    saved = max(0, old_total - new_total)
-    pct = saved / old_total * 100 if old_total else 0
+    percent_saved = (
+        (bytes_saved / converted_original_size) * 100
+        if converted_original_size
+        else 0
+    )
 
     st.success("Conversion complete.")
 
-    a, b, c, d = st.columns(4)
-    a.metric("Converted", f"{len(converted):,}")
-    b.metric("Skipped", f"{len(skipped):,}")
-    c.metric("Errors", f"{len(errors):,}")
-    d.metric("Space saved", f"{human_size(saved)} ({pct:.1f}%)")
+    r1, r2, r3, r4 = st.columns(4)
 
-    if converted:
-        zip_buffer = io.BytesIO()
+    with r1:
+        st.metric("Converted", f"{len(converted_files):,}")
+
+    with r2:
+        st.metric("Skipped", f"{len(skipped_files):,}")
+
+    with r3:
+        st.metric("Errors", f"{len(failed_files):,}")
+
+    with r4:
+        st.metric(
+            "Space saved",
+            f"{human_size(bytes_saved)} ({percent_saved:.1f}%)",
+        )
+
+    if converted_files:
+        zip_output = io.BytesIO()
+
         with zipfile.ZipFile(
-            zip_buffer,
+            zip_output,
             mode="w",
             compression=zipfile.ZIP_DEFLATED,
-        ) as zf:
-            for r in converted:
-                zf.writestr(r["name"], r["data"])
+        ) as archive:
+            for converted in converted_files:
+                archive.writestr(
+                    converted["name"],
+                    converted["data"],
+                )
 
-        zip_buffer.seek(0)
+        zip_output.seek(0)
 
         st.download_button(
-            "⬇️ Download Converted Images ZIP",
-            data=zip_buffer.getvalue(),
-            file_name=f"converted_{fmt.lower()}_images.zip",
+            label="⬇️ Download Converted Images ZIP",
+            data=zip_output.getvalue(),
+            file_name=f"converted_{output_format.lower()}_images.zip",
             mime="application/zip",
             type="primary",
             use_container_width=True,
         )
 
-    if skipped:
-        with st.expander("Skipped files", expanded=False):
-            for r in skipped[:200]:
-                st.write(f"• {r['name']} — {r['reason']}")
+    if converted_files:
+        with st.expander("Converted files"):
+            for converted in converted_files[:250]:
+                old_size = converted["original_size"]
+                new_size = converted["new_size"]
 
-    if errors:
+                reduction = (
+                    (1 - (new_size / old_size)) * 100
+                    if old_size
+                    else 0
+                )
+
+                st.write(
+                    f"✅ {converted['name']} — "
+                    f"{human_size(old_size)} → "
+                    f"{human_size(new_size)} "
+                    f"({reduction:.1f}% smaller)"
+                )
+
+    if skipped_files:
+        with st.expander("Skipped files"):
+            for skipped in skipped_files[:250]:
+                st.write(
+                    f"⏭️ {skipped['name']} — "
+                    f"{skipped['reason']}"
+                )
+
+    if failed_files:
         with st.expander("Errors", expanded=True):
-            for r in errors:
-                st.error(f"{r['name']}: {r['reason']}")
+            for failed in failed_files:
+                st.error(
+                    f"{failed['name']}: {failed['reason']}"
+                )
 '''
 
-requirements = """streamlit>=1.39
-Pillow>=10.0
+requirements = """streamlit>=1.39,<2
+Pillow>=10.4
 """
 
-readme = r'''
-# Hosted Image Optimizer
+readme = """# Image Optimizer & Converter
 
-This version is designed for Streamlit Community Cloud / streamlit.app.
+Deployment-ready Streamlit Cloud application.
 
-## Why there is no local folder picker
+## Files to upload to your GitHub repository
 
-A hosted Streamlit app runs on a remote server. The server cannot open Finder or directly access folders on your Mac.
+- `app.py`
+- `requirements.txt`
 
-Instead, this version lets you:
+## Streamlit Community Cloud
 
-- Upload multiple JPG / PNG / WebP files
-- Upload a ZIP containing a complete folder
-- Choose JPG / PNG / WebP output
-- Set image quality
-- Convert in the browser-hosted app
-- Download all converted images as a ZIP
+Set the Main file path to:
 
-## Deploy
+`app.py`
 
-Use:
+## How the hosted version works
 
-- app.py
-- requirements.txt
+A hosted Streamlit app cannot directly browse folders on the user's computer.
 
-Main file path: `app.py`
-'''
+The app therefore supports:
 
-(base / "app.py").write_text(app_code)
-(base / "requirements.txt").write_text(requirements)
-(base / "README.md").write_text(readme)
+1. Uploading multiple JPG, JPEG, PNG or WebP files.
+2. Uploading a ZIP containing a complete image folder.
+3. Choosing JPG, WebP or PNG output.
+4. Choosing quality/compression.
+5. Downloading all converted files as one ZIP.
 
-zip_path = Path("/mnt/data/Image_Optimizer_Streamlit_Hosted.zip")
+The application does not create any fixed local directories and does not use
+Tkinter or Finder APIs, so it is compatible with Streamlit Community Cloud.
+"""
+
+(out / "app.py").write_text(app_py, encoding="utf-8")
+(out / "requirements.txt").write_text(requirements, encoding="utf-8")
+(out / "README.md").write_text(readme, encoding="utf-8")
+
+zip_path = Path("/mnt/data/Image_Optimizer_Streamlit_FIXED.zip")
 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-    for f in base.iterdir():
-        z.write(f, arcname=f"Image_Optimizer_Streamlit_Hosted/{f.name}")
+    z.write(out / "app.py", arcname="app.py")
+    z.write(out / "requirements.txt", arcname="requirements.txt")
+    z.write(out / "README.md", arcname="README.md")
 
-print(zip_path)
+print("Created:", zip_path)
+print("app.py lines:", len(app_py.splitlines()))
+print("requirements:")
+print(requirements)
